@@ -1,0 +1,13 @@
+{
+    "terminal.integrated.profiles.windows": {
+        "PowerShell 7": {
+            "path": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "args": [
+                "-NoExit",
+                "-Command",
+                "& 'E:\\src-hermes-agent\\hermes-agent\\.venv\\Scripts\\Activate.ps1'"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "PowerShell 7"
+}
