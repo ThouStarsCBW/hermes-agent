@@ -32,6 +32,18 @@ from hermes_state_common import (
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
 
+# Characters FTS5's query grammar rejects outside a quoted phrase. Anything
+# missing from this set reaches MATCH raw and raises, which the execute site
+# swallows into zero results — the failure this strip step exists to prevent.
+# Assembled through re.escape so the backslash cannot be eaten as a regex
+# escape inside the class (it was, while the set was written as a literal).
+#
+# ``%`` is deliberately excluded: a CJK query falls back to a LIKE search that
+# needs it preserved as a literal (that path escapes wildcards itself), so
+# stripping it here widened those queries onto unrelated rows.
+_FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\''
+_FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
+
 
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
@@ -164,6 +176,16 @@ class SessionSearchMixin:
         The trash tables are PLAIN tables (their vtable parent was demoted
         away during the migration), so chunked DELETE + final DROP involve
         no FTS5 machinery at all. Returns True while teardown work remains.
+
+        Single-column-key trash tables (the common shape — FTS shadow
+        tables carry a rowid/integer PK) are drained with a high-water
+        marker mirroring :meth:`fts_rebuild_step`: each chunk deletes only
+        rows after the previously-drained key, so the per-chunk scan is
+        bounded instead of re-scanning from the start of the table every
+        chunk (O(n²) total on large trash tables, #79324). Compound-key
+        trash tables (multi-column PK) cannot use a scalar high-water
+        comparison, so they keep the legacy chunked ``LIMIT`` delete —
+        those shadow tables are small by construction.
         """
         with self._lock:
             trash = [
@@ -179,11 +201,62 @@ class SessionSearchMixin:
         tbl = trash[0]
 
         def _do(conn):
-            pk_cols = [
-                r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")
+            pk_info = [
+                (r[1], (r[2] or "").upper())
+                for r in conn.execute(f"PRAGMA table_info({tbl})")
                 if r[5] > 0
             ]
+            pk_cols = [name for name, _typ in pk_info]
             key = ", ".join(pk_cols) if pk_cols else "rowid"
+
+            if len(pk_cols) == 1 and (not pk_info or pk_info[0][1] == "INTEGER"):
+                # High-water drain: delete only rows past the marker key.
+                # The marker is read/written inside the same BEGIN IMMEDIATE
+                # transaction as the DELETE, so concurrent callers claim
+                # disjoint key ranges instead of re-deleting. Only integer
+                # PKs can anchor a numeric high-water comparison — the FTS
+                # config shadow table (TEXT pk like 'version') falls back to
+                # the legacy chunked delete below.
+                marker_key = f"fts_teardown_{tbl}_progress"
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (marker_key,),
+                ).fetchone()
+                high_water = int(row[0]) if row is not None else 0
+
+                # Claim the chunk's upper bound: the LAST row of the
+                # LIMIT window, so a full chunk is deleted per step.
+                upper_rows = conn.execute(
+                    f"SELECT {key} FROM {tbl} WHERE {key} > ? "
+                    f"ORDER BY {key} LIMIT {self._FTS_REBUILD_CHUNK_ROWS}",
+                    (high_water,),
+                ).fetchall()
+                if not upper_rows:
+                    # Drained — the DROP is cheap now.
+                    conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+                    conn.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                    logger.info("Old FTS shadow table %s torn down.", tbl)
+                    return True
+
+                upper = upper_rows[-1][0]
+                cur = conn.execute(
+                    f"DELETE FROM {tbl} WHERE {key} > ? AND {key} <= ?",
+                    (high_water, upper),
+                )
+                if cur.rowcount > 0:
+                    conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (marker_key, str(upper)),
+                    )
+                return True
+
+            # Compound-key or rowid trash table: legacy chunked delete.
+            # These shadow tables are small, so the quadratic re-scan is
+            # not a concern (#79324 keeps the high-water path for the big
+            # single-key tables).
             cur = conn.execute(
                 f"DELETE FROM {tbl} WHERE ({key}) IN "
                 f"(SELECT {key} FROM {tbl} LIMIT {self._FTS_REBUILD_CHUNK_ROWS})"
@@ -1042,19 +1115,33 @@ class SessionSearchMixin:
         active_clause = "" if include_inactive else " AND active = 1"
         # Match CLI/desktop: only real user turns, not timeline bookkeeping.
         display_clause = " AND (display_kind IS NULL OR display_kind = '')"
+        # Legacy standalone compaction handoffs (persisted pre-#80622) are
+        # durable role='user' rows with NO display_kind — SQL can't see them,
+        # so fetch with headroom and drop them in the decode loop below.
+        # Without this, /undo N and rewind pair an in-memory count that
+        # excludes handoffs with a DB pick that includes them, soft-deleting
+        # the wrong turn.
+        fetch_limit = int(limit) * 2 + 5
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, timestamp, content FROM messages "
                 "WHERE session_id = ? AND role = 'user'"
                 f"{active_clause}{display_clause} "
                 "ORDER BY id DESC LIMIT ?",
-                (session_id, int(limit)),
+                (session_id, fetch_limit),
             )
             rows = cursor.fetchall()
 
+        from agent.context_compressor import ContextCompressor
+
         result: List[Dict[str, Any]] = []
         for row in rows:
+            if len(result) >= int(limit):
+                break
             decoded = self._decode_content(row["content"])
+            if ContextCompressor._is_context_summary_content(decoded):
+                # Compaction handoff — never a user-originated turn (#80622).
+                continue
             if isinstance(decoded, list):
                 # Multimodal — flatten text parts.
                 text_parts = [
@@ -1135,7 +1222,21 @@ class SessionSearchMixin:
         # single ``content`` column, an unquoted colon query like ``TODO: fix``
         # parses as ``column:term`` and raises "no such column" — swallowed at
         # the execute site into zero results.  Strip it like the others.
-        sanitized = re.sub(r'[+{}():\"^]', " ", sanitized)
+        # The class below is every character FTS5's query grammar rejects
+        # outside a quoted phrase. Anything omitted here reaches MATCH raw and
+        # raises, which the execute site swallows into zero results — the
+        # failure mode this step exists to prevent. Measured against a real
+        # FTS5 table: ``it's``, ``gateway/run.py``, ``user@host``, ``a,b`` and
+        # ``50%`` all raised before the class was completed.
+        sanitized = _FTS5_SPECIAL_RE.sub(" ", sanitized)
+
+        # Step 2b: ``%`` is excluded from the class above only to protect the
+        # CJK LIKE-fallback path (LIKE treats % as a wildcard the fallback
+        # builds itself). A non-CJK query never reaches that fallback
+        # (``is_cjk`` gates it), so ``50%`` would sail into MATCH raw and
+        # raise like the rest. Strip it whenever the query has no CJK.
+        if "%" in sanitized and not SessionSearchMixin._contains_cjk(sanitized):
+            sanitized = sanitized.replace("%", " ")
 
         # Step 3: Collapse repeated * (e.g. "***") into a single one,
         # and remove leading * (prefix-only needs at least one char before *)

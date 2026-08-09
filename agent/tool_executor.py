@@ -102,6 +102,32 @@ _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 # to cover slow-but-legitimate authorization (e.g. an approval round-trip),
 # short enough that one wedged dispatch cannot starve the batch forever.
 _START_ORDER_GATE_TIMEOUT_S = 120.0
+# Fallback bound a concurrent worker will wait for the authorization gate's
+# serialization lock before running its prompt unserialized. The effective
+# bound is derived from ``approvals.timeout`` plus a margin (see
+# _authorization_gate_lock_timeout): a legitimate holder is at worst a human
+# answering an approval prompt, which self-terminates at approvals.timeout —
+# so a holder that overstays it is wedged and must not starve the batch.
+_AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 360.0
+
+
+def _authorization_gate_lock_timeout() -> float:
+    """Bound for the authorization serialization lock: approval timeout + margin.
+
+    Delegates to ``tools.approval.human_wait_ceiling`` — the same bound that
+    clamps a human-wait window's deadline contribution — so the two can't
+    drift. Long enough that serialization is never broken while a legitimate
+    approval prompt is still answerable; short enough that a wedged holder
+    (hanging ``pre_tool_call`` plugin, dead approval client) cannot park other
+    workers forever (#79719). Resolved once per gate (per batch), so a
+    mid-process ``approvals.timeout`` change applies from the next batch.
+    """
+    try:
+        from tools.approval import human_wait_ceiling
+
+        return human_wait_ceiling()
+    except Exception:
+        return _AUTHORIZATION_GATE_LOCK_TIMEOUT_S
 
 
 class _BatchAbandoned(BaseException):
@@ -166,9 +192,16 @@ def _flush_session_db_after_tool_progress(
         persisted = agent._flush_messages_to_session_db(messages) is not False
         if not persisted:
             agent._incremental_persistence_failed = True
+            # The flush caught its own exception and returned False; the
+            # classified cause (if any) was captured at the catch site. Only
+            # fall back to 'unknown' when nothing more specific is recorded.
+            if getattr(agent, "_last_persistence_error_cause", None) is None:
+                agent._last_persistence_error_cause = "unknown"
         return persisted
     except Exception as exc:
         agent._incremental_persistence_failed = True
+        from hermes_state import classify_persistence_error
+        agent._last_persistence_error_cause = classify_persistence_error(exc)
         logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
         return False
 
@@ -356,43 +389,82 @@ class _ManagedToolResult:
 
 
 class _ConcurrentToolAuthorizationGate:
-    """Serialize policy prompts and exclude their queue from batch deadlines."""
+    """Serialize policy prompts and exclude human approval waits from batch deadlines.
 
-    def __init__(self) -> None:
+    Serialization keeps concurrent approval prompts from interleaving on the
+    user's screen. The acquire is BOUNDED: a worker wedged inside the gate (a
+    hanging ``pre_tool_call`` plugin, or an approval round-trip to a client
+    that went away) must not park every other worker forever. On expiry the
+    worker runs its prompt unserialized — worst case is interleaved prompts,
+    strictly better than permanent starvation (same tradeoff as the
+    start-order gate, #79705).
+
+    Deadline exclusion is measured at the SOURCE of the human wait
+    (``tools.approval.human_wait_seconds``: the CLI prompt and the gateway
+    approval poll loop mark their own blocking windows), NOT as residency in
+    this gate. Gate residency is arbitrary code — using it as the exclusion
+    signal let a wedged plugin grow the exclusion 1:1 with wall clock, keeping
+    the batch deadline's ``remaining`` constant so it never fired and the turn
+    hung forever (#79719). A wedged plugin now contributes nothing to the
+    exclusion and the batch times out normally, while a genuine approval wait
+    (which can legitimately exceed any fixed bound) is still excluded in full.
+    """
+
+    def __init__(
+        self,
+        *,
+        lock_timeout: float | None = None,
+        session_key: str | None = None,
+    ) -> None:
         self._serialization_lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._pending = 0
-        self._window_started: float | None = None
-        self._excluded_seconds = 0.0
+        self._lock_timeout = (
+            _authorization_gate_lock_timeout()
+            if lock_timeout is None
+            else lock_timeout
+        )
+        self._session_key = session_key
+        if self._session_key is None:
+            try:
+                from tools.approval import get_current_session_key
+
+                # Snapshot the batch's session identity on the SUBMITTING
+                # thread: excluded_seconds() is polled from the batch wait
+                # loop, whose context may differ from the workers'.
+                self._session_key = get_current_session_key()
+            except Exception:
+                logger.debug(
+                    "authorization gate could not snapshot the session key; "
+                    "human-wait exclusion will re-resolve it at poll time",
+                    exc_info=True,
+                )
+        self._baseline_wait_seconds = self._human_wait_seconds()
+
+    def _human_wait_seconds(self) -> float:
+        try:
+            from tools.approval import human_wait_seconds
+
+            return human_wait_seconds(self._session_key)
+        except Exception:
+            return 0.0
 
     def run(self, callback):
-        now = time.monotonic()
-        with self._state_lock:
-            if self._pending == 0:
-                self._window_started = now
-            self._pending += 1
+        acquired = self._serialization_lock.acquire(timeout=self._lock_timeout)
+        if not acquired:
+            logger.warning(
+                "authorization gate lock not acquired after %.1fs "
+                "(holder wedged in a pre_tool_call plugin or approval "
+                "round-trip?); running prompt unserialized",
+                self._lock_timeout,
+            )
+            return callback()
         try:
-            with self._serialization_lock:
-                return callback()
+            return callback()
         finally:
-            now = time.monotonic()
-            with self._state_lock:
-                self._pending -= 1
-                if self._pending == 0:
-                    if self._window_started is not None:
-                        self._excluded_seconds += max(
-                            0.0, now - self._window_started
-                        )
-                    self._window_started = None
+            self._serialization_lock.release()
 
     def excluded_seconds(self) -> float:
-        """Return completed plus currently active authorization wait time."""
-        now = time.monotonic()
-        with self._state_lock:
-            excluded = self._excluded_seconds
-            if self._window_started is not None:
-                excluded += max(0.0, now - self._window_started)
-            return excluded
+        """Return human-approval wait seconds accrued since the batch started."""
+        return max(0.0, self._human_wait_seconds() - self._baseline_wait_seconds)
 
 
 def _managed_values(
@@ -1808,6 +1880,25 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_preview', function_args, tool_duration, result=function_result)}")
+        elif function_name == "read_window_below":
+            def _execute(next_args: dict) -> Any:
+                from tools.read_window_tool import read_window_below_tool as _read_window_below_tool
+                return _read_window_below_tool(
+                    callback=getattr(agent, "read_window_below_callback", None),
+                )
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('read_window_below', function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):

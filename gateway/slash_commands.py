@@ -2519,34 +2519,34 @@ class GatewaySlashCommandsMixin:
             lines.append(t("gateway.personality.usage"))
             return "\n".join(lines)
 
-        def _resolve_prompt(value):
-            if isinstance(value, dict):
-                parts = [value.get("system_prompt", "")]
-                if value.get("tone"):
-                    parts.append(f'Tone: {value["tone"]}')
-                if value.get("style"):
-                    parts.append(f'Style: {value["style"]}')
-                return "\n".join(p for p in parts if p)
-            return str(value)
+        from hermes_cli.config import (
+            _prompt_text,
+            render_personality_prompt,
+        )
 
         if args in {"none", "default", "neutral"}:
+            # Persist the selection only. Never clear agent.system_prompt —
+            # that field is the user-owned manual overlay.
             try:
-                if "agent" not in config or not isinstance(config.get("agent"), dict):
-                    config["agent"] = {}
-                config["agent"]["system_prompt"] = ""
+                if "display" not in config or not isinstance(config.get("display"), dict):
+                    config["display"] = {}
+                config["display"]["personality"] = ""
                 atomic_config_write(config_path, config)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
-            self._ephemeral_system_prompt = ""
+            self._ephemeral_system_prompt = _prompt_text(
+                cfg_get(config, "agent", "system_prompt", default="")
+            )
             return t("gateway.personality.cleared")
         elif args in personalities:
-            new_prompt = _resolve_prompt(personalities[args])
+            new_prompt = render_personality_prompt(personalities[args])
 
-            # Write to config.yaml, same pattern as CLI save_config_value.
+            # Persist the personality name only — never write personality text
+            # into agent.system_prompt (user-owned manual overlay).
             try:
-                if "agent" not in config or not isinstance(config.get("agent"), dict):
-                    config["agent"] = {}
-                config["agent"]["system_prompt"] = new_prompt
+                if "display" not in config or not isinstance(config.get("display"), dict):
+                    config["display"] = {}
+                config["display"]["personality"] = args
                 atomic_config_write(config_path, config)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
@@ -2572,9 +2572,15 @@ class GatewaySlashCommandsMixin:
         # and re-sent opaque bookkeeping text (same class as the TUI ordinal).
         last_user_msg = None
         last_user_idx = None
+        # is_user_originated_turn: excludes display_kind bookkeeping AND
+        # compaction handoffs (durable role=user, sometimes without
+        # display_kind on legacy sessions; #80622) — /retry must never
+        # re-send a reference-only summary as if the user asked it.
+        from agent.context_compressor import is_user_originated_turn
+
         for i in range(len(history) - 1, -1, -1):
             msg = history[i]
-            if msg.get("role") == "user" and not msg.get("display_kind"):
+            if is_user_originated_turn(msg):
                 last_user_msg = msg.get("content", "")
                 last_user_idx = i
                 break
@@ -2582,9 +2588,16 @@ class GatewaySlashCommandsMixin:
         if not last_user_msg:
             return t("gateway.retry.no_previous")
         
-        # Truncate history to before the last user message and persist
+        # Truncate history to before the last user message and persist only the
+        # live view. After in-place compaction the pre-compaction transcript
+        # lives on as active=0/compacted=1 rows under this same session id, and
+        # a bare rewrite (active_only=False) would DELETE them (same class as
+        # #61145). /retry never intends to purge archived history, so avoid a
+        # separate existence probe: it could fail open or race with the write.
         truncated = history[:last_user_idx]
-        await self.async_session_store.rewrite_transcript(session_entry.session_id, truncated)
+        await self.async_session_store.rewrite_transcript(
+            session_entry.session_id, truncated, active_only=True
+        )
         # Reset stored token count — transcript was truncated
         session_entry.last_prompt_tokens = 0
 
@@ -5642,7 +5655,7 @@ class GatewaySlashCommandsMixin:
                     with open(output_path, "wb") as f:
                         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
                         rc = proc.wait(timeout=3600)
-                    with open(exit_code_path, "w") as f:
+                    with open(exit_code_path, "w", encoding="utf-8") as f:
                         f.write(str(rc))
                     """
                 ).strip()
