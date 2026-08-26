@@ -1,14 +1,25 @@
+import { useStore } from '@nanostores/react'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
-import { useEffect } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { useEffect, useRef } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
-import { getAllSessionMessages, getLatestSessionMessages, getSession, type SessionInfo } from '@/hermes'
+import {
+  deleteSession,
+  getAllSessionMessages,
+  getLatestSessionMessages,
+  getSession,
+  type SessionInfo,
+  type SessionResumeResponse
+} from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
-import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
+import { requestGatewayForAgent } from '@/store/gateway'
+import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
@@ -22,8 +33,11 @@ import {
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  $turnStartedAt,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
+  setAwaitingResponse,
+  setBusy,
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentModel,
@@ -33,14 +47,19 @@ import {
   setNewChatWorkspaceTarget,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
-  setSessions
+  setSessions,
+  setTurnStartedAt
 } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionTiles } from '@/store/session-states'
 
+import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
+import { deferred } from '../../../test/deferred'
 import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
+import { useSessionStateCache } from './use-session-state-cache'
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -55,7 +74,13 @@ vi.mock('@/hermes', async importOriginal => ({
 
 vi.mock('@/store/profile', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
+  ensureGatewayAgent: vi.fn().mockResolvedValue(undefined),
   ensureGatewayProfile: vi.fn().mockResolvedValue(undefined)
+}))
+
+vi.mock('@/store/gateway', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  requestGatewayForAgent: vi.fn()
 }))
 
 vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
@@ -66,19 +91,13 @@ vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void
-
-  const promise = new Promise<T>(done => {
-    resolve = done
-  })
-
-  return { promise, resolve }
-}
-
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'selectSidebarItem' | 'startFreshSessionDraft'
+  | 'createBackendSessionForSend'
+  | 'openNewSessionTile'
+  | 'removeSession'
+  | 'selectSidebarItem'
+  | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -101,19 +120,23 @@ function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 function Harness({
+  activeSessionId = null,
   navigate = vi.fn(),
   onReady,
-  requestGateway
+  requestGateway,
+  selectedStoredSessionId = null
 }: {
+  activeSessionId?: null | string
   navigate?: ReturnType<typeof vi.fn>
   onReady: (handle: HarnessHandle) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  selectedStoredSessionId?: null | string
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
 
   const actions = useSessionActions({
-    activeSessionId: null,
-    activeSessionIdRef: ref<string | null>(null),
+    activeSessionId,
+    activeSessionIdRef: ref(activeSessionId),
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
@@ -123,8 +146,8 @@ function Harness({
     requestGateway,
     resetViewSync: vi.fn(),
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
-    selectedStoredSessionId: null,
-    selectedStoredSessionIdRef: ref<string | null>(null),
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef: ref(selectedStoredSessionId),
     sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
     syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
@@ -136,6 +159,54 @@ function Harness({
 
   return null
 }
+
+describe('connection-qualified session deletion', () => {
+  afterEach(() => {
+    cleanup()
+    setSessions([])
+    vi.clearAllMocks()
+  })
+
+  it('deletes a registry session through its captured connection owner', async () => {
+    const requestGateway = vi.fn().mockResolvedValue({})
+    let actions: HarnessHandle | null = null
+
+    setSessions([
+      storedSession({
+        connection_id: 'source-a',
+        id: 'shared-session',
+        profile: 'worker'
+      })
+    ])
+    vi.mocked(deleteSession).mockResolvedValue({ ok: true })
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+
+    render(
+      <Harness
+        activeSessionId="runtime-shared"
+        onReady={value => {
+          actions = value
+        }}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="shared-session"
+      />
+    )
+    await waitFor(() => expect(actions).not.toBeNull())
+
+    await act(async () => {
+      await actions?.removeSession('shared-session')
+    })
+
+    expect(deleteSession).toHaveBeenCalledWith('shared-session', {
+      connectionId: 'source-a',
+      profile: 'worker'
+    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-a', 'worker', 'session.close', {
+      session_id: 'runtime-shared'
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('session.close', expect.anything())
+  })
+})
 
 function StoredIdRotationHarness({
   activeSessionIdRef,
@@ -464,6 +535,7 @@ describe('createBackendSessionForSend profile routing', () => {
   afterEach(() => {
     cleanup()
     $newChatProfile.set(null)
+    $newChatRoute.set(null)
     $activeGatewayProfile.set('default')
     $projectScope.set(ALL_PROJECTS)
     $projectTree.set([])
@@ -519,6 +591,41 @@ describe('createBackendSessionForSend profile routing', () => {
     })
 
     expect(params).toMatchObject({ cwd: '/remote/worktree' })
+  })
+
+  it('keeps a route-aware New Chat pinned when foreground activation changes before Send', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'default',
+      targetProfile: 'backend-default'
+    }
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({
+      session_id: RUNTIME_SESSION_ID,
+      stored_session_id: null
+    } as never)
+
+    $newChatProfile.set(route.profile)
+    $newChatRoute.set({ ...route })
+    $activeGatewayProfile.set('other-connection-profile')
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.createBackendSessionForSend()
+    })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'default',
+      'session.create',
+      expect.objectContaining({ profile: 'backend-default', source: 'desktop' })
+    )
+    expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
   })
 
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {
@@ -605,7 +712,9 @@ function ResumeHarness({
   sessionStateByRuntimeIdRef
 }: {
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
-  onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
+  onReady: (
+    resume: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
+  ) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
   selectedStoredSessionId?: string | null
@@ -631,8 +740,10 @@ function ResumeHarness({
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
     sessionStateByRuntimeIdRef: stateMapRef,
     syncSessionStateToView: vi.fn(),
-    updateSessionState: (sessionId, updater) => {
-      const current = stateMapRef.current.get(sessionId) ?? ({} as ClientSessionState)
+    updateSessionState: (sessionId, updater, storedSessionId) => {
+      // Full default shape (not a bare {} cast) so seeded/derived fields like
+      // turnStartedAt behave as in production state updates.
+      const current = stateMapRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
       const next = updater(current)
 
       stateMapRef.current.set(sessionId, next)
@@ -649,6 +760,51 @@ function ResumeHarness({
   return null
 }
 
+function ResumeTimerHarness({
+  onReady,
+  requestGateway
+}: {
+  onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
+  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+}) {
+  const activeSessionId = useStore($activeSessionId)
+  const busyRef = useRef(false)
+
+  const cache = useSessionStateCache({
+    activeSessionId,
+    busyRef,
+    selectedStoredSessionId: null,
+    setAwaitingResponse,
+    setBusy,
+    setMessages
+  })
+
+  const actions = useSessionActions({
+    activeSessionId,
+    activeSessionIdRef: cache.activeSessionIdRef,
+    busyRef,
+    creatingSessionRef: useRef(false),
+    ensureSessionState: cache.ensureSessionState,
+    getRouteToken: () => 'timer-contract',
+    navigate: vi.fn() as never,
+    requestGateway,
+    resetViewSync: cache.resetViewSync,
+    runtimeIdByStoredSessionIdRef: cache.runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionId: null,
+    selectedStoredSessionIdRef: cache.selectedStoredSessionIdRef,
+    sessionStateByRuntimeIdRef: cache.sessionStateByRuntimeIdRef,
+    syncSessionStateToView: cache.syncSessionStateToView,
+    getRoutedStoredSessionId: () => null,
+    updateSessionState: cache.updateSessionState
+  })
+
+  useEffect(() => {
+    onReady(actions.resumeSession)
+  }, [actions.resumeSession, onReady])
+
+  return null
+}
+
 describe('resumeSession failure recovery', () => {
   afterEach(() => {
     cleanup()
@@ -656,6 +812,7 @@ describe('resumeSession failure recovery', () => {
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
+    clearClarifyRequest()
     vi.restoreAllMocks()
   })
 
@@ -671,6 +828,132 @@ describe('resumeSession failure recovery', () => {
     await waitFor(() => expect(resume).not.toBeNull())
     await resume!('stored-1', true)
   }
+
+  it.each([
+    ['Codex tool-only', ''],
+    ['DeepSeek text-plus-tool', 'I found two paths; choose one.']
+  ])('restores a pending clarify as a running inline card for a %s transcript', async (_shape, content) => {
+    const stateMapRef: MutableRefObject<Map<string, ClientSessionState>> = { current: new Map() }
+
+    const toolCall = {
+      function: { arguments: '{"question":"Which path?","choices":["safe","fast"]}', name: 'clarify' },
+      id: 'call-provider'
+    }
+
+    setSessions([storedSession({ id: 'stored-1', message_count: 2 })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        { content, role: 'assistant', timestamp: 2, tool_calls: [toolCall] }
+      ],
+      session_id: 'stored-1'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          pending_clarify: {
+            choices: ['safe', 'fast'],
+            question: 'Which path?',
+            request_id: 'req-resumed'
+          },
+          resumed: 'stored-1',
+          running: true,
+          session_id: 'runtime-1',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, { sessionStateByRuntimeIdRef: stateMapRef })
+
+    const state = stateMapRef.current.get('runtime-1')
+
+    const clarifyMessages =
+      state?.messages.filter(message =>
+        message.parts.some(part => part.type === 'tool-call' && part.toolName === 'clarify')
+      ) ?? []
+
+    expect(clarifyMessages).toHaveLength(1)
+    expect(clarifyMessages[0].pending).toBe(true)
+    expect(state?.streamId).toBe(clarifyMessages[0].id)
+    expect($clarifyRequests.get()['runtime-1']).toMatchObject({ requestId: 'req-resumed', question: 'Which path?' })
+  })
+
+  it('restores a pending batch clarify whose resume snapshot has no top-level question', async () => {
+    const stateMapRef: MutableRefObject<Map<string, ClientSessionState>> = { current: new Map() }
+
+    setSessions([storedSession({ id: 'stored-1', message_count: 2 })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        {
+          content: '',
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [
+            {
+              function: {
+                arguments: '{"questions":[{"question":"Color?"},{"question":"Size?"}]}',
+                name: 'clarify'
+              },
+              id: 'call-batch-provider'
+            }
+          ]
+        }
+      ],
+      session_id: 'stored-1'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          pending_clarify: {
+            answers: { q0: 'Blue' },
+            questions: [
+              { choices: ['Blue', 'Red'], qid: 'q0', question: 'Color?' },
+              { choices: ['Small', 'Large'], qid: 'q1', question: 'Size?' }
+            ],
+            request_id: 'req-batch-resumed'
+          },
+          resumed: 'stored-1',
+          running: true,
+          session_id: 'runtime-1',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, { sessionStateByRuntimeIdRef: stateMapRef })
+
+    const state = stateMapRef.current.get('runtime-1')
+    const request = $clarifyRequests.get()['runtime-1']
+    expect(request).toMatchObject({
+      lockedAnswers: { q0: 'Blue' },
+      question: '',
+      requestId: 'req-batch-resumed'
+    })
+    expect(request.questions).toHaveLength(2)
+    expect(
+      state?.messages
+        .flatMap(message => message.parts)
+        .filter(part => part.type === 'tool-call' && part.toolName === 'clarify')
+    ).toHaveLength(1)
+    expect(state?.messages.filter(message => message.pending)).toHaveLength(1)
+    expect(state?.streamId).toBe(state?.messages.find(message => message.pending)?.id)
+  })
 
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
     // session.resume rejects (e.g. timeout against a wedged backend)...
@@ -793,6 +1076,7 @@ describe('resumeSession failure recovery', () => {
           message_count: compressedRuntimeMessages.length,
           messages: compressedRuntimeMessages,
           running: true,
+          turn_started_at: 1_700_000_000,
           inflight: {
             user: 'current prompt',
             assistant: 'partial answer',
@@ -823,6 +1107,7 @@ describe('resumeSession failure recovery', () => {
     expect(renderedMessages).toContain('current prompt')
     expect(renderedMessages).toContain('partial answer')
     expect(renderedMessages).toContain('newest prompt')
+    expect(resumedState?.turnStartedAt).toBe(1_700_000_000_000)
   })
 
   it('preserves a runtime-cache delta that arrives while cold resume waits for REST', async () => {
@@ -1072,6 +1357,7 @@ describe('resumeSession failure recovery', () => {
             storedSessionId: 'stored-1',
             streamId: null,
             turnStartedAt: null,
+            turnLive: false,
             usage: null,
             yolo: false
           }
@@ -1107,24 +1393,115 @@ describe('resumeSession failure recovery', () => {
   })
 })
 
+describe('session.resume turn timer contract', () => {
+  beforeEach(() => {
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback: FrameRequestCallback) => {
+      callback(0)
+
+      return null as unknown as number
+    })
+    setActiveSessionId(null)
+    setAwaitingResponse(false)
+    setBusy(false)
+    setMessages([])
+    setSessions([])
+    setTurnStartedAt(null)
+  })
+
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setAwaitingResponse(false)
+    setBusy(false)
+    setMessages([])
+    setSessions([])
+    setTurnStartedAt(null)
+    vi.restoreAllMocks()
+  })
+
+  async function resumeFrom(response: unknown): Promise<void> {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        // Model the JSON-RPC serialization/deserialization boundary. The shared
+        // fixture is asserted against the real gateway response in Python.
+        return JSON.parse(JSON.stringify(response)) as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getAllSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-running' } as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeTimerHarness onReady={ready => (resume = ready)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+    await act(async () => {
+      await resume!('stored-running', true)
+    })
+  }
+
+  it('restores the canonical gateway turn timestamp in milliseconds', async () => {
+    await resumeFrom(sessionResumeActiveTurn)
+
+    expect($turnStartedAt.get()).toBe(sessionResumeActiveTurn.turn_started_at * 1000)
+  })
+
+  it('clears a stale timer when the gateway response is not running', async () => {
+    setTurnStartedAt(1_600_000_000_000)
+
+    await resumeFrom({ ...sessionResumeActiveTurn, running: false })
+
+    expect($turnStartedAt.get()).toBeNull()
+  })
+
+  it('clears a stale timer when the running gateway response omits its timestamp', async () => {
+    const missingTimestamp: Record<string, unknown> = JSON.parse(JSON.stringify(sessionResumeActiveTurn))
+    delete missingTimestamp.turn_started_at
+    setTurnStartedAt(1_600_000_000_000)
+
+    await resumeFrom(missingTimestamp)
+
+    expect($turnStartedAt.get()).toBeNull()
+  })
+
+  it('clears a stale timer when the running gateway response has a non-numeric timestamp', async () => {
+    setTurnStartedAt(1_600_000_000_000)
+
+    await resumeFrom({ ...sessionResumeActiveTurn, turn_started_at: 'not-a-timestamp' })
+
+    expect($turnStartedAt.get()).toBeNull()
+  })
+})
+
 function BranchHarness({
   activeSessionId = null,
   navigate = vi.fn(),
   onCurrentReady,
   onReady,
-  requestGateway
+  onRefs,
+  requestGateway,
+  selectedStoredSessionId = null
 }: {
   activeSessionId?: string | null
   navigate?: ReturnType<typeof vi.fn>
   onCurrentReady?: (branchCurrentSession: (messageId?: string) => Promise<boolean>) => void
   onReady: (branchStoredSession: (storedSessionId: string, sessionProfile?: string | null) => Promise<boolean>) => void
+  onRefs?: (refs: {
+    activeSessionIdRef: MutableRefObject<string | null>
+    selectedStoredSessionIdRef: MutableRefObject<string | null>
+  }) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  selectedStoredSessionId?: string | null
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+  const activeSessionIdRef = ref<string | null>(activeSessionId)
+  const selectedStoredSessionIdRef = ref<string | null>(selectedStoredSessionId)
+
+  onRefs?.({ activeSessionIdRef, selectedStoredSessionIdRef })
 
   const actions = useSessionActions({
     activeSessionId,
-    activeSessionIdRef: ref<string | null>(activeSessionId),
+    activeSessionIdRef,
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
@@ -1134,8 +1511,8 @@ function BranchHarness({
     requestGateway,
     resetViewSync: vi.fn(),
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
-    selectedStoredSessionId: null,
-    selectedStoredSessionIdRef: ref<string | null>(null),
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
     syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
@@ -1158,10 +1535,21 @@ describe('branchStoredSession desktop source tagging', () => {
     vi.restoreAllMocks()
   })
 
-  it('opens the branch as a new tab and leaves the parent chat selected', async () => {
+  it('opens the branch as the primary session in the main workspace (#93444)', async () => {
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.create') {
         return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 0,
+          messages: [],
+          resumed: 'branch-stored',
+          session_id: 'branch-runtime',
+          session_key: 'branch-stored'
+        } as never
       }
 
       return {} as never
@@ -1182,17 +1570,69 @@ describe('branchStoredSession desktop source tagging', () => {
         navigate={navigate}
         onReady={branch => (branchStoredSession = branch)}
         requestGateway={requestGateway}
+        selectedStoredSessionId="stored-parent"
       />
     )
     await waitFor(() => expect(branchStoredSession).not.toBeNull())
 
     await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
 
-    // The branch opened as its own tab...
+    // The branch becomes the primary session — this is what routes the main
+    // workspace area to it, not just a new sidebar row.
+    expect($selectedStoredSessionId.get()).toBe('branch-stored')
+    // It must not ALSO exist as a tile: a session is either the main thread or
+    // a tile, never both (resumeSession closes any tile with the same id).
+    expect($sessionTiles.get().some(tile => tile.storedSessionId === 'branch-stored')).toBe(false)
+  })
+
+  it('keeps the current view when branching a different session from the sidebar (does not reintroduce #69750)', async () => {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 0,
+          messages: [],
+          resumed: 'branch-stored',
+          session_id: 'branch-runtime',
+          session_key: 'branch-stored'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    // The user is looking at "stored-other" and right-clicks a DIFFERENT,
+    // unrelated session ("stored-parent") in the sidebar to branch it.
+    setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
+    setSelectedStoredSessionId('stored-other')
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    const navigate = vi.fn()
+    let branchStoredSession: ((storedSessionId: string) => Promise<boolean>) | null = null
+    render(
+      <BranchHarness
+        navigate={navigate}
+        onReady={branch => (branchStoredSession = branch)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-other"
+      />
+    )
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
+
+    // Branching a session that is not the one currently open must not steal
+    // the user's active view — "stored-other" stays selected.
+    expect($selectedStoredSessionId.get()).toBe('stored-other')
+    // The branch instead opens as its own tile.
     expect($sessionTiles.get().some(tile => tile.storedSessionId === 'branch-stored')).toBe(true)
-    // ...without stealing the primary selection or navigating away from the parent.
-    expect($selectedStoredSessionId.get()).toBe('stored-parent')
-    expect(navigate).not.toHaveBeenCalledWith(sessionRoute('branch-stored'))
   })
 
   it('tags desktop branch sessions as desktop sessions', async () => {
@@ -1274,6 +1714,95 @@ describe('branchStoredSession desktop source tagging', () => {
       count: 2
     })
     expect(branchParams).toEqual({ session_id: 'live-parent', count: 2 })
+  })
+
+  it('hydrates the complete persisted display transcript before branching a compacted live chat', async () => {
+    let branchParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.branch') {
+        branchParams = params
+
+        return {
+          session_id: 'branch-runtime',
+          stored_session_id: 'branch-stored',
+          title: 'Branch',
+          message_count: 4,
+          messages: [],
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    setSessions([storedSession({ id: 'stored-parent', message_count: 4 })])
+    setMessages([
+      { id: 'summary', role: 'assistant', parts: [{ type: 'text', text: 'compact summary' }] },
+      { id: 'tail-user', role: 'user', parts: [{ type: 'text', text: 'second question' }] },
+      { id: 'tail-assistant', role: 'assistant', parts: [{ type: 'text', text: 'second answer' }] }
+    ])
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'first question', role: 'user', timestamp: 1 },
+        { content: 'first answer', role: 'assistant', timestamp: 2 },
+        { content: 'second question', role: 'user', timestamp: 3 },
+        { content: 'second answer', role: 'assistant', timestamp: 4 }
+      ],
+      session_id: 'stored-parent'
+    } as never)
+
+    let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
+    render(
+      <BranchHarness
+        activeSessionId="live-parent"
+        onCurrentReady={branch => (branchCurrentSession = branch)}
+        onReady={() => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-parent"
+      />
+    )
+    await waitFor(() => expect(branchCurrentSession).not.toBeNull())
+
+    await expect(branchCurrentSession!()).resolves.toBe(true)
+
+    expect(getAllSessionMessages).toHaveBeenCalledWith('stored-parent', undefined)
+    expect(branchParams).toEqual({ session_id: 'live-parent' })
+  })
+
+  it('aborts if the active runtime changes while the branch transcript is hydrating', async () => {
+    let refs: {
+      activeSessionIdRef: MutableRefObject<string | null>
+      selectedStoredSessionIdRef: MutableRefObject<string | null>
+    } | null = null
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    setMessages([{ id: 'q1', role: 'user', parts: [{ type: 'text', text: 'question' }] }])
+    vi.mocked(getAllSessionMessages).mockImplementation(async () => {
+      refs!.activeSessionIdRef.current = 'live-other'
+
+      return {
+        messages: [{ content: 'question', role: 'user', timestamp: 1 }],
+        session_id: 'stored-parent'
+      } as never
+    })
+
+    let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
+    render(
+      <BranchHarness
+        activeSessionId="live-parent"
+        onCurrentReady={branch => (branchCurrentSession = branch)}
+        onReady={() => undefined}
+        onRefs={value => (refs = value)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-parent"
+      />
+    )
+    await waitFor(() => expect(branchCurrentSession).not.toBeNull())
+
+    await expect(branchCurrentSession!()).resolves.toBe(false)
+    expect(requestGateway).not.toHaveBeenCalledWith('session.branch', expect.anything())
   })
 
   // #67603: right-clicking a session outside the paginated sidebar window is a
@@ -1457,7 +1986,111 @@ describe('resumeSession warm-cache mapping integrity', () => {
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
+    vi.mocked(getSession).mockReset()
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockResolvedValue({ messages: [] } as never)
+    vi.mocked(requestGatewayForAgent).mockReset()
+    clearClarifyRequest()
     vi.restoreAllMocks()
+  })
+
+  it('pins metadata, transcript, resume, activate, and usage to the captured connection', async () => {
+    const ownerRoute: SessionProfileRoute = {
+      connectionId: 'source-a',
+      mode: 'remote',
+      profile: 'default',
+      targetProfile: 'backend-default'
+    }
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-warm', 'runtime-warm']])
+    }
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['runtime-warm', clientState('stored-warm')]])
+    }
+
+    // Same-name rows without a source tag are not authoritative for an
+    // explicit owner. Metadata must be re-read from the captured connection.
+    setSessions([storedSession({ id: 'stored-warm', profile: 'default' })])
+    vi.mocked(getSession).mockImplementation(async id => storedSession({ id, profile: 'default' }))
+    vi.mocked(getLatestSessionMessages).mockImplementation(async id => ({ messages: [], session_id: id }) as never)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method, params) => {
+      if (method === 'session.activate') {
+        throw new Error('Method not found')
+      }
+
+      if (method === 'session.usage') {
+        return { input: 1, output: 2, total: 3 } as never
+      }
+
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          messages: [],
+          resumed: params?.session_id,
+          session_id: 'runtime-cold'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    let resume:
+      null | ((storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>) =
+      null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={ambientRequest}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    await resume!('stored-warm', true, ownerRoute)
+    await resume!('stored-cold', true, ownerRoute)
+    await resume!('stored-cold', true, {
+      connectionId: 'source-b',
+      mode: 'remote',
+      profile: 'default',
+      targetProfile: 'backend-b'
+    })
+
+    const restScope = { connectionId: 'source-a', profile: 'backend-default' }
+    expect(getSession).toHaveBeenCalledWith('stored-warm', restScope)
+    expect(getSession).toHaveBeenCalledWith('stored-cold', restScope)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-warm', restScope)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-cold', restScope)
+    expect(getSession).toHaveBeenCalledWith('stored-cold', {
+      connectionId: 'source-b',
+      profile: 'backend-b'
+    })
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-cold', {
+      connectionId: 'source-b',
+      profile: 'backend-b'
+    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'default',
+      'session.activate',
+      expect.objectContaining({ session_id: 'runtime-warm' })
+    )
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-a', 'default', 'session.usage', {
+      session_id: 'runtime-warm'
+    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'default',
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-cold' })
+    )
+    expect(ambientRequest).not.toHaveBeenCalled()
   })
 
   it('rejects a cross-wired runtime mapping and falls through to a full resume', async () => {
@@ -1499,11 +2132,71 @@ describe('resumeSession warm-cache mapping integrity', () => {
     // resume RPC ran, for the session that was actually requested.
     const resumeCalls = requestGateway.mock.calls.filter(([method]) => method === 'session.resume')
     expect(resumeCalls.length).toBe(1)
-    expect(resumeCalls[0][1]).toMatchObject({ session_id: 'stored-A' })
+    expect(resumeCalls[0][1]).toMatchObject({
+      defer_history: true,
+      session_id: 'stored-A'
+    })
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
 
     // The corrupt mapping was purged so it can't mis-resolve again.
     expect(runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
     expect(sessionStateByRuntimeIdRef.current.has('rt-recycled')).toBe(false)
+  })
+
+  it('paints the bounded latest transcript after the deferred resume acknowledgement', async () => {
+    const latestPage = Array.from({ length: 500 }, (_, index) => ({
+      content: `message-${index}`,
+      role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
+      timestamp: index + 1
+    }))
+
+    setSessions([storedSession({ id: 'stored-A', message_count: 50_000 })])
+    vi.mocked(getLatestSessionMessages).mockReset()
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: latestPage,
+      pagination: { limit: 500, offset: 0, order: 'latest', returned: 500 },
+      session_id: 'stored-A'
+    })
+
+    const deferredResume = deferred<SessionResumeResponse>()
+
+    const requestGatewayMock = vi.fn((method: string, _params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        return deferredResume.promise
+      }
+
+      return Promise.resolve({})
+    })
+
+    const requestGateway = <T,>(method: string, params?: Record<string, unknown>): Promise<T> =>
+      requestGatewayMock(method, params) as Promise<T>
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeHarness onReady={value => (resume = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+    const resumePromise = resume!('stored-A', true)
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledTimes(1))
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
+    expect($messages.get()).toHaveLength(0)
+    expect(requestGatewayMock).toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({
+        defer_history: true,
+        omit_messages: true,
+        session_id: 'stored-A'
+      })
+    )
+
+    deferredResume.resolve({
+      session_id: 'rt-A',
+      resumed: 'stored-A',
+      message_count: 500,
+      messages: [],
+      info: {}
+    })
+    await resumePromise
+    expect($messages.get()).toHaveLength(500)
   })
 
   it('honours a warm cache entry whose stored id matches and refreshes its persisted transcript', async () => {
@@ -1560,6 +2253,265 @@ describe('resumeSession warm-cache mapping integrity', () => {
       expect.objectContaining({ omit_messages: true, session_id: 'rt-A' })
     )
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+  })
+
+  it('re-arms a pending clarify in place on the warm session.activate path', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const state = clientState('stored-A')
+    state.messages = [
+      { id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] },
+      {
+        id: 'cached-assistant',
+        role: 'assistant',
+        parts: [
+          { type: 'text', text: 'I found two paths.' },
+          {
+            type: 'tool-call',
+            toolCallId: 'call-provider',
+            toolName: 'clarify',
+            args: { choices: ['safe', 'fast'], question: 'Which path?' },
+            argsText: '{"question":"Which path?","choices":["safe","fast"]}'
+          }
+        ]
+      }
+    ]
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', state]])
+    }
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        {
+          content: 'I found two paths.',
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [
+            {
+              function: {
+                arguments: '{"question":"Which path?","choices":["safe","fast"]}',
+                name: 'clarify'
+              },
+              id: 'call-provider'
+            }
+          ]
+        }
+      ],
+      session_id: 'stored-A'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          pending_clarify: {
+            choices: ['safe', 'fast'],
+            question: 'Which path?',
+            request_id: 'req-warm'
+          },
+          resumed: 'stored-A',
+          running: true,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    const resumedState = sessionStateByRuntimeIdRef.current.get('rt-A')
+
+    const clarifyMessages =
+      resumedState?.messages.filter(message =>
+        message.parts.some(part => part.type === 'tool-call' && part.toolName === 'clarify')
+      ) ?? []
+
+    expect(requestGateway.mock.calls.map(([method]) => method)).toContain('session.activate')
+    expect(clarifyMessages).toHaveLength(1)
+    expect(clarifyMessages[0].pending).toBe(true)
+    expect(
+      clarifyMessages[0].parts.find(part => part.type === 'tool-call' && part.toolName === 'clarify')
+    ).toMatchObject({ toolCallId: 'call-provider' })
+    expect(resumedState?.streamId).toBe(clarifyMessages[0].id)
+    expect($clarifyRequests.get()['rt-A']).toMatchObject({ requestId: 'req-warm' })
+  })
+
+  it.each([
+    ['with a stale request-store entry', true],
+    ['after the request store was already cleared', false]
+  ])('de-arms stale clarify state %s when session.activate reports no pending request', async (_case, keepStore) => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const state = clientState('stored-A')
+    state.busy = true
+    state.needsInput = true
+    state.streamId = 'cached-assistant'
+    state.messages = [
+      { id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] },
+      {
+        id: 'cached-assistant',
+        role: 'assistant',
+        pending: true,
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-provider',
+            toolName: 'clarify',
+            args: { choices: ['safe', 'fast'], question: 'Which path?' },
+            argsText: '{"question":"Which path?","choices":["safe","fast"]}'
+          }
+        ]
+      }
+    ]
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', state]])
+    }
+
+    if (keepStore) {
+      setClarifyRequest({
+        choices: ['safe', 'fast'],
+        multiSelect: false,
+        question: 'Which path?',
+        requestId: 'req-stale',
+        sessionId: 'rt-A'
+      })
+    }
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        {
+          content: '',
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [
+            {
+              function: {
+                arguments: '{"question":"Which path?","choices":["safe","fast"]}',
+                name: 'clarify'
+              },
+              id: 'call-provider'
+            }
+          ]
+        }
+      ],
+      session_id: 'stored-A'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-A',
+          running: false,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    const resumedState = sessionStateByRuntimeIdRef.current.get('rt-A')
+
+    const clarifyPart = resumedState?.messages
+      .flatMap(message => message.parts)
+      .find(part => part.type === 'tool-call' && part.toolName === 'clarify')
+
+    expect($clarifyRequests.get()['rt-A']).toBeUndefined()
+    expect(resumedState).toMatchObject({ needsInput: false, streamId: null })
+    expect(resumedState?.messages.find(message => message.id === resumedState.streamId)).toBeUndefined()
+    expect(clarifyPart).toHaveProperty('result')
+  })
+
+  it('does not let an older activate response clear a newer clarify request', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', clientState('stored-A')]])
+    }
+
+    const activated = deferred<SessionResumeResponse>()
+
+    const requestGateway = vi.fn((method: string) =>
+      method === 'session.activate' ? activated.promise : Promise.resolve({})
+    )
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway as never}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    const resumePromise = resume!('stored-A', true)
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.activate', expect.anything()))
+
+    setClarifyRequest({
+      choices: ['new'],
+      multiSelect: false,
+      question: 'New question?',
+      receivedAt: Date.now() / 1000 + 60,
+      requestId: 'req-newer',
+      sessionId: 'rt-A'
+    })
+    activated.resolve({
+      info: {},
+      message_count: 0,
+      messages: [],
+      messages_omitted: true,
+      resumed: 'stored-A',
+      running: false,
+      session_id: 'rt-A',
+      session_key: 'stored-A'
+    })
+    await resumePromise
+
+    expect($clarifyRequests.get()['rt-A']).toMatchObject({ requestId: 'req-newer' })
   })
 
   it('preserves cached image attachments through an idle persisted transcript refresh', async () => {
@@ -1630,6 +2582,67 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(requestGateway.mock.calls.map(([method]) => method)).toContain('session.activate')
     expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
     expect(resumedState?.messages[0]?.attachmentRefs).toEqual(['@image:/tmp/photo.png'])
+  })
+
+  it('restores the warm reconnect turn clock from session.activate', async () => {
+    const turnStartedAtSeconds = 1_700_000_123
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const cachedState = clientState('stored-A')
+    cachedState.busy = true
+    cachedState.turnStartedAt = null
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', cachedState]])
+    }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          session_id: 'rt-A',
+          session_key: 'stored-A',
+          resumed: 'stored-A',
+          message_count: 0,
+          messages: [],
+          running: true,
+          turn_started_at: turnStartedAtSeconds,
+          inflight: {
+            user: 'current prompt',
+            assistant: 'partial answer',
+            streaming: true
+          },
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getAllSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resumedState: ClientSessionState | undefined
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        onStateUpdate={(_sessionId, state) => (resumedState = state)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    expect(resumedState).toMatchObject({
+      awaitingResponse: true,
+      busy: true,
+      turnStartedAt: turnStartedAtSeconds * 1000
+    })
+    expect(JSON.stringify(resumedState?.messages)).toContain('partial answer')
   })
 
   it('repairs an idle warm cache from a divergent equal-length persisted transcript', async () => {
@@ -2134,6 +3147,7 @@ describe('createBackendSessionForSend workspace target', () => {
     cleanup()
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
+    $projectScope.set(ALL_PROJECTS)
     setCurrentCwd('')
     setNewChatWorkspaceTarget(undefined)
     vi.restoreAllMocks()
@@ -2166,6 +3180,69 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).toMatchObject({ cwd: '/clicked-workspace' })
+  })
+
+  it('does not inherit a stale cwd when Home is the active project scope', async () => {
+    const params = await createWith(
+      () => {
+        $projectScope.set(NO_PROJECT_ID)
+      },
+      () => {
+        // Simulate the stale live path left by the previously selected project
+        // before the new draft is submitted.
+        $currentCwd.set('/previous-project')
+      }
+    )
+
+    expect(params).not.toHaveProperty('cwd')
+  })
+})
+
+describe('openNewSessionTile workspace target', () => {
+  afterEach(() => {
+    cleanup()
+    $projectScope.set(ALL_PROJECTS)
+    $projectTree.set([])
+    vi.restoreAllMocks()
+  })
+
+  it('omits cwd for a Home tile even when project scope resolves to a repo', async () => {
+    $projectScope.set('p_voice')
+    $projectTree.set([
+      {
+        id: 'p_voice',
+        label: 'Voice Assistant',
+        path: '/Users/oschmidt/Checkouts/voice-assistant',
+        repos: [],
+        sessionCount: 0
+      } as never
+    ])
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return {
+          info: { cwd: '', model: 'test-model', tools: {}, skills: {} },
+          session_id: RUNTIME_SESSION_ID,
+          stored_session_id: 'stored-home-tile'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('center', { cwd: null, listed: false })
+    })
+
+    expect(createParams).not.toHaveProperty('cwd')
   })
 })
 describe('selectSidebarItem', () => {

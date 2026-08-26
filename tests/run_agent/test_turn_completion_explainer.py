@@ -140,6 +140,20 @@ def test_explanation_persistence_disk_cause_keeps_disk_wording():
     assert "free some space" in lower or "disk space" in lower
 
 
+def test_explanation_persistence_corrupt_cause_never_says_free_space():
+    """Structural corruption must point at the repair path, not disk space
+    (the #77386-family misdiagnosis: 'database disk image is malformed'
+    rendered as 'this is often a full disk')."""
+    out = AIAgent._format_turn_completion_explanation(
+        "session_persistence_failed", "corrupt"
+    )
+    lower = out.lower()
+    assert "corrupt" in lower
+    assert "hermes doctor" in lower
+    assert "free some space" not in lower
+    assert "full disk" not in lower
+
+
 def test_explanation_persistence_unknown_cause_is_neutral():
     """None/'unknown' cause must not claim disk-full — point at diagnostics."""
     for cause in (None, "unknown"):
@@ -197,6 +211,30 @@ def test_classify_persistence_error_categories():
     assert classify_persistence_error("something else entirely") == "unknown"
     assert classify_persistence_error(None) == "unknown"
     assert classify_persistence_error("") == "unknown"
+
+
+def test_classify_persistence_error_corruption_beats_disk_bucket():
+    """'database disk image is malformed' contains the word 'disk', so
+    without an explicit corruption bucket it classified as 'disk' and the
+    user was told to free space for a structurally damaged file (#77386
+    comment thread, v0.20.0 malformed-DB incident)."""
+    import sqlite3
+
+    from hermes_state import classify_persistence_error
+
+    assert classify_persistence_error(
+        sqlite3.DatabaseError("database disk image is malformed")
+    ) == "corrupt"
+    assert classify_persistence_error(
+        "database disk image is malformed"
+    ) == "corrupt"
+    assert classify_persistence_error(
+        sqlite3.DatabaseError("file is not a database")
+    ) == "corrupt"
+    assert classify_persistence_error("malformed database schema") == "corrupt"
+    # Genuine disk-space failures must keep classifying as 'disk'.
+    assert classify_persistence_error("database or disk is full") == "disk"
+    assert classify_persistence_error("disk I/O error") == "disk"
 
 
 def test_classify_persistence_error_reuses_disk_full_markers():
@@ -266,6 +304,7 @@ def test_persistence_error_causes_tuple_matches_classifier():
         "database is locked",
         "Session 'abc' is being compressed by another writer",
         "Session turn lease lost; refusing transcript write for 'abc'",
+        "database disk image is malformed",
         "database or disk is full",
         "something else entirely",
         None,
@@ -291,6 +330,41 @@ def test_explainer_disabled_via_env():
         os.environ, {"HERMES_TURN_COMPLETION_EXPLAINER": "0"}, clear=False
     ):
         assert agent._turn_completion_explainer_enabled() is False
+
+
+def test_explainer_config_read_once_then_cached():
+    """Measured-work pin: the config lookup happens once per agent.
+
+    The explainer gate runs at the end of every turn, so a fresh
+    ``load_config()`` per call is wasted work (measured ~0.9 ms/call on a
+    warm mtime-cache on this host; per-turn config reads were killed
+    repo-wide in #74211, and this seam was missed).  The config read must
+    be cached after the first call; the env-var override must still win on
+    every call, cached or not.
+    """
+    agent = _make_agent()
+    calls = {"n": 0}
+
+    def counting_load():
+        calls["n"] += 1
+        return {"display": {"turn_completion_explainer": True}}
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("HERMES_TURN_COMPLETION_EXPLAINER", None)
+        with patch("hermes_cli.config.load_config", counting_load):
+            # First call reads config and caches the result.
+            assert agent._turn_completion_explainer_enabled() is True
+            assert calls["n"] == 1
+            # Subsequent calls must not re-read config.
+            assert agent._turn_completion_explainer_enabled() is True
+            assert agent._turn_completion_explainer_enabled() is True
+            assert calls["n"] == 1
+            # Env override stays authoritative even after the cache is warm.
+            with patch.dict(
+                os.environ, {"HERMES_TURN_COMPLETION_EXPLAINER": "0"}, clear=False
+            ):
+                assert agent._turn_completion_explainer_enabled() is False
+            assert calls["n"] == 1  # env path never touches config
 
 
 

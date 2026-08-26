@@ -123,6 +123,60 @@ class TestSubprocessEnvironment:
         assert "PYTHONHOME" not in env
         assert env["KEEP_ME"] == "yes"
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX PATH-floor semantics")
+    def test_subprocess_env_floors_version_manager_only_path(self, monkeypatch):
+        """Profile workers (kanban bots, cron) can inherit a PATH of only
+        version-manager dirs (observed in the wild: one nvm dir repeated
+        7x). The uv browser-use trampoline resolves dirname/realpath
+        through PATH, so /usr/bin must be guaranteed or the CLI dies
+        'realpath: not found' (exit 127) before its Python starts."""
+        import sys
+        from types import ModuleType
+
+        browser_tool = ModuleType("tools.browser_tool")
+        browser_tool._build_browser_env = lambda: {
+            "PATH": os.pathsep.join(
+                ["/home/u/.nvm/versions/node/v24.18.0/bin"] * 7
+            ),
+        }
+        monkeypatch.setitem(sys.modules, "tools.browser_tool", browser_tool)
+
+        env = bu_cli._base_subprocess_env()
+
+        parts = env["PATH"].split(os.pathsep)
+        assert "/usr/bin" in parts
+        assert "/bin" in parts
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX PATH-floor semantics")
+    def test_floor_preserves_existing_entries_and_order(self):
+        """The floor only adds dirs — never drops or reorders what the
+        caller's environment already had."""
+        original = "/opt/toolchain/bin:/usr/bin:/snap/bin"
+        merged = bu_cli._floor_subprocess_path(original).split(os.pathsep)
+
+        assert set(original.split(os.pathsep)) <= set(merged)
+        positions = [merged.index(p) for p in original.split(os.pathsep)]
+        assert positions == sorted(positions)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX PATH-floor semantics")
+    def test_floor_survives_missing_sibling_helper(self, monkeypatch):
+        """If browser_tool stops exporting _merge_browser_path, the floor
+        degrades to appending FHS bin dirs instead of vanishing."""
+        import sys
+        from types import ModuleType
+
+        browser_tool = ModuleType("tools.browser_tool")
+        browser_tool._build_browser_env = lambda: {
+            "PATH": "/home/u/.nvm/versions/node/v24.18.0/bin"
+        }
+        monkeypatch.setitem(sys.modules, "tools.browser_tool", browser_tool)
+
+        env = bu_cli._base_subprocess_env()
+
+        parts = env["PATH"].split(os.pathsep)
+        assert "/usr/bin" in parts
+        assert "/home/u/.nvm/versions/node/v24.18.0/bin" in parts
+
 
 class TestToolSurfaceSwap:
     def test_legacy_browser_tools_hidden_in_cli_mode(self, monkeypatch):
@@ -395,20 +449,129 @@ class TestBackendCdpResolution:
         err = bu_cli._resolve_backend_cdp(self._env(), "t1")
         assert err and "no" in err.lower() and "CDP" in err
 
-    def test_named_session_skips_backend_resolution(self, tmp_path, monkeypatch):
-        """session=<name> (BU_NAME cloud browser) must not consume a backend
-        provider session."""
+    def test_named_session_composes_with_provider_backend(self, tmp_path, monkeypatch):
+        """session=<name> composes with a configured provider backend: the
+        name keys its OWN provider browser (bu-named-<name>), so concurrent
+        named sessions never share one browser (#86894)."""
         import tools.browser_tool as bt
 
-        def fail(task_id):
-            raise AssertionError("backend resolution must be skipped")
+        seen = []
 
-        monkeypatch.setattr(bt, "_get_session_info", fail)
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
+        def fake_session_info(key):
+            seen.append(key)
+            return {"cdp_url": "wss://browser.example/cdp/" + key}
+
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(bt, "_get_session_info", fake_session_info)
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME ws:$BU_CDP_WS"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
         assert result["success"] is True
+        assert seen == ["bu-named-r7k2"]
         assert "bu:r7k2" in result["output"]
+        assert "ws:wss://browser.example/cdp/bu-named-r7k2" in result["output"]
+
+    def test_named_session_key_stable_across_tasks(self, monkeypatch):
+        """The same session name maps to the same provider cache key no
+        matter which task calls it — that is what lets a follow-up call
+        reattach to the same cloud browser."""
+        import tools.browser_tool as bt
+
+        seen = []
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(
+            bt, "_get_session_info",
+            lambda key: seen.append(key) or {"cdp_url": "wss://x/cdp/a"},
+        )
+        env1, env2 = {}, {}
+        assert bu_cli._resolve_backend_cdp(env1, "task-A", session_name="research") is None
+        assert bu_cli._resolve_backend_cdp(env2, "task-B", session_name="research") is None
+        assert seen == ["bu-named-research", "bu-named-research"]
+
+    def test_named_session_direct_api_bu_cloud_still_skips_provider(
+        self, tmp_path, monkeypatch
+    ):
+        """Direct-API Browser Use cloud configs keep the native named-daemon
+        path: resolving through the provider would double-session and
+        double-bill."""
+        import tools.browser_tool as bt
+
+        class _BUProvider:
+            name = "browser-use"
+
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: _BUProvider())
+        monkeypatch.setattr(
+            bt, "_get_session_info",
+            lambda key: (_ for _ in ()).throw(AssertionError("must skip provider")),
+        )
+        monkeypatch.setattr(bu_cli, "_read_browser_cfg", lambda: {"cloud_provider": "browser-use"})
+        env = {}
+        assert bu_cli._resolve_backend_cdp(env, "t1", session_name="r7k2") is None
+        assert "BU_CDP_WS" not in env and "BU_CDP_URL" not in env
+
+
+class TestOwnTabPreamble:
+    """Named sessions on SHARED browsers get the own-tab preamble prepended;
+    private per-name browsers and unnamed sessions do not."""
+
+    def _run(self, tmp_path, monkeypatch, *, session="", private=False, provider=False):
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        if provider:
+            monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
+            monkeypatch.setattr(
+                bt, "_get_session_info",
+                lambda key: {"cdp_url": "wss://browser.example/cdp/" + key},
+            )
+        else:
+            monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
+        # fake CLI echoes stdin back so we can inspect what code was sent
+        cli = _fake_cli(tmp_path, "cat\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        return json.loads(bu_cli.browser_exec("print('payload')", session=session))
+
+    def test_named_shared_browser_gets_preamble(self, tmp_path, monkeypatch):
+        result = self._run(tmp_path, monkeypatch, session="r7k2")
+        assert result["success"] is True
+        assert "_hermes_ensure_own_tab" in result["output"]
+        # model code still present, after the preamble
+        assert result["output"].index("_hermes_ensure_own_tab") < result["output"].index("print('payload')")
+
+    def test_unnamed_session_gets_no_preamble(self, tmp_path, monkeypatch):
+        result = self._run(tmp_path, monkeypatch, session="")
+        assert result["success"] is True
+        assert "_hermes_ensure_own_tab" not in result["output"]
+
+    def test_named_provider_browser_skips_preamble(self, tmp_path, monkeypatch):
+        """Per-name provider browsers are private — preamble would leak a tab."""
+        result = self._run(tmp_path, monkeypatch, session="r7k2", provider=True)
+        assert result["success"] is True
+        assert "_hermes_ensure_own_tab" not in result["output"]
+
+    def test_sentinel_never_reaches_subprocess_env(self, tmp_path, monkeypatch):
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(
+            bt, "_get_session_info",
+            lambda key: {"cdp_url": "wss://browser.example/cdp/" + key},
+        )
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "sentinel:${_HERMES_BU_PRIVATE_BROWSER:-unset}"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
+        assert "sentinel:unset" in result["output"]
+
+    def test_preamble_is_valid_python(self):
+        import ast
+
+        ast.parse(bu_cli._OWN_TAB_PREAMBLE)
+        # and composes with model code
+        ast.parse(bu_cli._OWN_TAB_PREAMBLE + "print('x')")
 
 
 class TestProviderPickerIntegration:

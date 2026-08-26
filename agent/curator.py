@@ -369,7 +369,22 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
             continue
 
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
-            ok, _msg = _u.archive_skill(name)
+            # Tag the ledger entry with the curator actor: this archive is an
+            # autonomous curator transition, not a foreground agent/user call.
+            try:
+                from tools.skill_ledger import reset_ledger_actor, set_ledger_actor
+                _tok = set_ledger_actor("curator")
+            except Exception:
+                _tok = None
+                reset_ledger_actor = None  # type: ignore[assignment]
+            try:
+                ok, _msg = _u.archive_skill(name)
+            finally:
+                if _tok is not None and reset_ledger_actor is not None:
+                    try:
+                        reset_ledger_actor(_tok)
+                    except Exception:
+                        pass
             if ok:
                 counts["archived"] += 1
         elif anchor <= stale_cutoff and current == _u.STATE_ACTIVE:
@@ -524,6 +539,13 @@ CURATOR_REVIEW_PROMPT = (
     "merges.\n\n"
     "Your toolset:\n"
     "  - skills_list, skill_view        — read the current landscape\n"
+    "    READ BEFORE WRITE — enforced, not advisory. Before skill_manage "
+    "action=patch, action=edit, action=write_file on a file that already "
+    "exists, or action=remove_file, call skill_view on that SAME target in "
+    "this review turn — skill_view(name) for SKILL.md, "
+    "skill_view(name, file_path=...) for a supporting file — and build the "
+    "write from the content it just returned. A write without that read is "
+    "REFUSED and nothing is saved.\n"
     "  - skill_manage action=patch      — add sections to the umbrella\n"
     "  - skill_manage action=create     — create a new umbrella SKILL.md\n"
     "  - skill_manage action=write_file — add a references/, templates/, "

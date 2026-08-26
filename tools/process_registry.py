@@ -73,6 +73,16 @@ MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_m
 WATCH_MIN_INTERVAL_SECONDS = 15   # Minimum spacing between consecutive watch matches
 WATCH_STRIKE_LIMIT = 3            # Strikes in a row → disable watch + promote to notify_on_complete
 
+# Lifetime cap — independent of the strike counter above. A process whose
+# pattern recurs at a cadence just above WATCH_MIN_INTERVAL_SECONDS (e.g. a
+# service restarted repeatedly over a day) never trips the consecutive-strike
+# limit, since each match lands in its own clean cooldown window, yet still
+# forces a full-context agent turn every single time (#93513). watch_patterns
+# is documented as "ONLY for rare one-shot mid-process signals", so once a
+# session has delivered this many matches over its whole life we disable it
+# and fall back to notify_on_complete, same as the strike-limit path.
+WATCH_LIFETIME_MAX_HITS = 8
+
 # Global circuit breaker — across all sessions. Secondary safety net so concurrent
 # siblings can't collectively flood the user even when each is under its own cap.
 WATCH_GLOBAL_MAX_PER_WINDOW = 15
@@ -526,6 +536,12 @@ class ProcessRegistry:
         disabled for this session and the session is promoted to
         notify_on_complete semantics — one notification when the process
         actually exits, no more mid-process spam.
+
+        Independently, WATCH_LIFETIME_MAX_HITS caps the total number of
+        matches ever delivered for a session, so a pattern that keeps
+        recurring at a cadence just above the cooldown (e.g. a service
+        restarted repeatedly over a day) still gets disabled instead of
+        forcing a full-context agent turn indefinitely.
         """
         if not session.watch_patterns or session._watch_disabled:
             return
@@ -552,6 +568,7 @@ class ProcessRegistry:
 
         now = time.time()
         should_disable = False
+        lifetime_exhausted = False
         with session._lock:
             # Case 1: still inside the cooldown from the last emission.
             # Count this as a strike for the current window (only once per window)
@@ -590,6 +607,13 @@ class ProcessRegistry:
                 suppressed = session._watch_suppressed
                 session._watch_suppressed = 0
                 return_early = False
+                # Lifetime cap: this match is delivered (it already earned it),
+                # but disable further ones regardless of how cleanly spaced
+                # they are — see WATCH_LIFETIME_MAX_HITS above.
+                lifetime_exhausted = session._watch_hits >= WATCH_LIFETIME_MAX_HITS
+                if lifetime_exhausted:
+                    session._watch_disabled = True
+                    session.notify_on_complete = True
 
         if return_early:
             if should_disable:
@@ -598,6 +622,7 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "task_id": session.task_id,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -624,11 +649,18 @@ class ProcessRegistry:
 
         # Global circuit breaker — across all sessions (secondary safety net).
         if not self._global_watch_admit(now):
+            if lifetime_exhausted:
+                # The final match was dropped by the global breaker, but the
+                # session is already disabled — still tell the user why things
+                # went quiet (the strike path emits its summary unconditionally
+                # too).
+                self._emit_lifetime_watch_disabled(session)
             return
 
         notification = {
             "session_id": session.id,
             "session_key": session.session_key,
+            "task_id": session.task_id,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -643,6 +675,34 @@ class ProcessRegistry:
         }
         _redact_process_result(notification)
         self.completion_queue.put(notification)
+
+        if lifetime_exhausted:
+            # Same "why things went quiet" summary as the strike-limit path,
+            # queued right after the final delivered match.
+            self._emit_lifetime_watch_disabled(session)
+
+    def _emit_lifetime_watch_disabled(self, session: ProcessSession) -> None:
+        """Queue the watch_disabled summary for the lifetime-cap path (#93513)."""
+        self.completion_queue.put({
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "task_id": session.task_id,
+            "command": session.command,
+            "type": "watch_disabled",
+            "suppressed": 0,
+            "platform": session.watcher_platform,
+            "chat_id": session.watcher_chat_id,
+            "user_id": session.watcher_user_id,
+            "user_name": session.watcher_user_name,
+            "thread_id": session.watcher_thread_id,
+            "message_id": session.watcher_message_id,
+            "message": (
+                f"Watch patterns disabled for process {session.id} — "
+                f"reached the lifetime cap of {WATCH_LIFETIME_MAX_HITS} delivered "
+                f"matches. Falling back to notify_on_complete semantics; you'll get "
+                f"exactly one notification when the process exits."
+            ),
+        })
 
     def _global_watch_admit(self, now: float) -> bool:
         """Return True if this watch_match event is allowed through the global breaker.
@@ -1574,6 +1634,7 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "task_id": session.task_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -1629,6 +1690,138 @@ class ProcessRegistry:
                 return False
         return True
 
+    def wait_for_pending_completions(
+        self,
+        task_id: Optional[str] = None,
+        *,
+        timeout: float | None = None,
+        poll_interval: float = 1.0,
+    ) -> dict:
+        """Bounded wait for tracked ``notify_on_complete`` background processes.
+
+        One-shot CLI runs (``hermes -q/-Q/-z``) exit as soon as their single
+        turn ends.  Any background process the turn spawned with
+        ``notify_on_complete=True`` — a bounded task whose completion the
+        caller explicitly cares about — still holds a stdout pipe owned by
+        the dying parent, so it is killed by SIGPIPE on its next write a few
+        seconds later.  Bot Mode handoff REPLIES are the visible casualty
+        (#90879): a recipient invoked as ``hermes -p <bot> chat -Q
+        --query-file ...`` dispatches its reply via ``message_agent`` /
+        ``bot_relay`` exactly this way, then exits, and the reply process is
+        destroyed ~3s later.  The sender waits forever for a reply that was
+        already killed.
+
+        Called from the one-shot exit paths so the parent lingers (bounded)
+        until those deliveries actually finish.  This fixes the class — ANY
+        bounded background task in a one-shot run, not just DMs: bot_mode_dm
+        deliveries, bot_relay waiter processes, and plain
+        ``terminal(background=true, notify_on_complete=true)`` jobs.
+
+        Only ``notify_on_complete`` processes are waited on. Plain background
+        processes (servers, daemons, watch-pattern monitors) carry no
+        completion contract and are not the parent's to wait for.
+
+        Args:
+            task_id: restrict to processes spawned for this task; ``None``
+                waits on every tracked process (a one-shot CLI process hosts
+                exactly one agent, so its registry is private to that run).
+            timeout: max seconds to linger. ``None`` reads
+                ``terminal.oneshot_completion_wait_seconds`` from config
+                (default 600). ``<= 0`` disables the wait entirely.
+            poll_interval: per-pass event-wait bound; each pass re-reconciles
+                child state so an orphaned-pipe exit (#17327) can't wedge the
+                linger for the full timeout.
+
+        Returns:
+            ``{"waited": [...], "completed": [...], "timed_out": [...]}``
+            (session ids). All lists empty when there was nothing to wait on.
+        """
+        if timeout is None:
+            timeout = self._oneshot_completion_wait_seconds()
+        result: dict = {"waited": [], "completed": [], "timed_out": []}
+        with self._lock:
+            pending = [
+                s
+                for s in self._running.values()
+                if s.notify_on_complete
+                and not s.exited
+                and (task_id is None or s.task_id == task_id)
+            ]
+        if not pending or timeout <= 0:
+            return result
+        result["waited"] = [s.id for s in pending]
+        logger.info(
+            "One-shot exit lingering (bounded %ss) for %d notify_on_complete "
+            "background process(es): %s",
+            timeout,
+            len(pending),
+            ", ".join(s.id for s in pending),
+        )
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        interval = max(float(poll_interval), 0.05)
+        try:
+            from tools.interrupt import is_interrupted as _is_interrupted
+        except Exception:
+            def _is_interrupted() -> bool:
+                return False
+        interrupted = False
+        for session in pending:
+            try:
+                while not session.exited:
+                    if interrupted or _is_interrupted():
+                        interrupted = True
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    # Reconcile first: catches direct-child exits whose reader
+                    # is blocked on a pipe held open by a descendant (#17327)
+                    # and detached/env sessions, so the event actually fires.
+                    try:
+                        self._reconcile_local_exit(session)
+                        self._refresh_detached_session(session)
+                    except Exception:
+                        pass
+                    if session.exited:
+                        break
+                    session._completion_event.wait(min(remaining, interval))
+            except KeyboardInterrupt:
+                # User aborted the linger — stop waiting on everything but
+                # never let the interrupt skip the caller's durable teardown
+                # (session flush, end_session) that follows this wait.
+                interrupted = True
+            if session.exited:
+                result["completed"].append(session.id)
+            else:
+                result["timed_out"].append(session.id)
+        if result["timed_out"]:
+            logger.warning(
+                "One-shot exit linger timed out after %ss with %d background "
+                "process(es) still running: %s — they may be killed when this "
+                "process exits.",
+                timeout,
+                len(result["timed_out"]),
+                ", ".join(result["timed_out"]),
+            )
+        return result
+
+    @staticmethod
+    def _oneshot_completion_wait_seconds() -> float:
+        """Bounded linger (s) for one-shot exits with pending notify_on_complete
+        processes.  Read from ``terminal.oneshot_completion_wait_seconds``;
+        0 disables. Falls back to the DEFAULT_CONFIG value (600) when config
+        is unreadable so callers always get a sane bound.
+        """
+        try:
+            from hermes_cli.config import DEFAULT_CONFIG, cfg_get, read_raw_config
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "terminal", "oneshot_completion_wait_seconds")
+            if val is None:
+                val = DEFAULT_CONFIG["terminal"]["oneshot_completion_wait_seconds"]
+            return max(float(val), 0.0)
+        except Exception:
+            return 600.0
+
     def _drain_should_skip(
         self, session_id: str, *, skip_poll_observed: bool = True
     ) -> bool:
@@ -1645,6 +1838,26 @@ class ProcessRegistry:
         return session_id in self._completion_consumed or (
             skip_poll_observed and session_id in self._poll_observed
         )
+
+    @staticmethod
+    def _surface_child_process_notifications() -> bool:
+        """Whether subagent-owned process notifications surface in the parent.
+
+        Read from ``delegation.surface_child_process_notifications`` in
+        config.yaml (default false = suppress). On any config read error the
+        DEFAULT applies (suppress) — never crash the drain loop.
+        """
+        try:
+            from hermes_cli.config import DEFAULT_CONFIG, cfg_get, read_raw_config
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "delegation", "surface_child_process_notifications")
+            if val is None:
+                val = DEFAULT_CONFIG["delegation"][
+                    "surface_child_process_notifications"
+                ]
+            return bool(val)
+        except Exception:
+            return False
 
     def drain_notifications(
         self,
@@ -1684,6 +1897,10 @@ class ProcessRegistry:
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
+        # Lazily-read flag for subagent-owned process notifications
+        # (delegation.surface_child_process_notifications, default false).
+        # Read at most once per drain, and only when an sa- event shows up.
+        surface_child: "bool | None" = None
         while not self.completion_queue.empty():
             try:
                 evt = self.completion_queue.get_nowait()
@@ -1726,6 +1943,28 @@ class ProcessRegistry:
             ):
                 continue
 
+            # Subagent-owned process notifications (task_id "sa-...") are
+            # suppressed from the parent conversation by default — the
+            # child's consolidated delegation result is the deliverable;
+            # "npm ci finished" walls mid-chat are noise. Dropped, NOT
+            # requeued (children never drain notify events, so requeueing
+            # would pin them in the queue forever). Type 'async_delegation'
+            # is the delegation result itself and is NEVER suppressed.
+            _evt_task_id = str(evt.get("task_id") or "")
+            if not is_async_delegation and _evt_task_id.startswith("sa-"):
+                if surface_child is None:
+                    surface_child = self._surface_child_process_notifications()
+                if not surface_child:
+                    logger.debug(
+                        "Suppressed subagent-owned process notification "
+                        "(delegation.surface_child_process_notifications=false): "
+                        "type=%s session_id=%s task_id=%s",
+                        evt.get("type", "completion"),
+                        _evt_sid,
+                        _evt_task_id,
+                    )
+                    continue
+
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
@@ -1733,11 +1972,55 @@ class ProcessRegistry:
             self.completion_queue.put(evt)
         return results
 
+    # Minimum characters of the random suffix required for prefix resolution.
+    # Short prefixes ("p", "pr", "proc_1") are too collision-prone to act on.
+    _MIN_PREFIX_CHARS = 4
+
     def get(self, session_id: str) -> Optional[ProcessSession]:
-        """Get a session by ID (running or finished)."""
+        """Get a session by ID (running or finished).
+
+        Accepts either the full ID or a unique ID prefix (inspired by Factory
+        Droid's task-ID prefixes, and the same UX as ``git``/``docker`` short
+        hashes): ``proc_4dae`` — or just the bare suffix ``4dae`` — resolves
+        to ``proc_4dae56ca81f6`` when exactly one session matches. Ambiguous
+        or too-short prefixes resolve to None (callers already report
+        "No process with ID ..."), never to an arbitrary pick.
+        """
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
+        if session is None:
+            session = self._resolve_prefix(session_id)
         return self._refresh_detached_session(session)
+
+    def _resolve_prefix(self, session_id: str) -> Optional[ProcessSession]:
+        """Resolve a unique session-ID prefix to its session, else None.
+
+        Exact lookups happen in :meth:`get` before this runs, so a full ID
+        never pays the scan. Matching is prefix-only (no substring) and
+        requires a unique hit; a bare suffix without the ``proc_`` lead is
+        normalized so users can paste just the hex tail.
+        """
+        if not session_id or not isinstance(session_id, str):
+            return None
+        query = session_id.strip()
+        if not query:
+            return None
+        # Allow the bare suffix form: "4dae56" -> "proc_4dae56".
+        if not query.startswith("proc_"):
+            query = f"proc_{query}"
+        suffix = query[len("proc_"):]
+        if len(suffix) < self._MIN_PREFIX_CHARS:
+            return None
+        with self._lock:
+            matches = [
+                s
+                for store in (self._running, self._finished)
+                for sid, s in store.items()
+                if sid.startswith(query)
+            ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def _reconcile_local_exit(self, session: "ProcessSession") -> None:
         """Reconcile session.exited against the real child process state.
@@ -2828,6 +3111,45 @@ def _format_async_delegation(evt: dict) -> str:
     return "\n".join(lines)
 
 
+def _delegation_attribution_line(evt: dict) -> "str | None":
+    """One-line delegation attribution for a child-originated process event.
+
+    Subagents run their terminal sessions under ``task_id == subagent_id``
+    (delegate_tool._run_single_child). When a background process they started
+    completes, its notification is routed to the PARENT conversation by
+    design (children consume their own waits via process(wait); anything
+    that outlives the child must land where a durable consumer exists).
+    Without attribution the parent-facing user sees an anonymous raw output
+    wall mid-conversation with no hint it came from a delegation. Resolve
+    the task_id against the live + recently-finished subagent registry and
+    return a short provenance line, or None for parent-owned processes.
+    """
+    task_id = str(evt.get("task_id") or "")
+    if not task_id.startswith("sa-"):
+        return None
+    try:
+        from tools.delegate_tool import get_subagent_attribution
+
+        info = get_subagent_attribution(task_id)
+    except Exception:
+        info = None
+    if not info:
+        # The task_id shape says "subagent" even when the registry entry has
+        # aged out — still attribute generically rather than anonymously.
+        return f"Started by subagent {task_id} (delegate_task)."
+    goal = str(info.get("goal") or "").strip()
+    if len(goal) > 120:
+        goal = goal[:117] + "..."
+    deleg = info.get("delegation_id")
+    parts = [f"Started by subagent {task_id}"]
+    if deleg:
+        parts.append(f"of delegation {deleg}")
+    line = " ".join(parts) + "."
+    if goal:
+        line += f' Task: "{goal}"'
+    return line
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -2837,6 +3159,7 @@ def format_process_notification(evt: dict) -> "str | None":
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
+    _attribution = _delegation_attribution_line(evt)
 
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
@@ -2854,6 +3177,10 @@ def format_process_notification(evt: dict) -> "str | None":
         text = (
             f"[IMPORTANT: Background process {_sid} matched "
             f"watch pattern \"{_pat}\".\n"
+        )
+        if _attribution:
+            text += f"{_attribution}\n"
+        text += (
             f"Command: {_cmd}\n"
             f"Matched output:\n{_out}"
         )
@@ -2882,12 +3209,26 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "completed normally"
     else:
         _status = "exited"
-    return (
+    text = (
         f"[IMPORTANT: Background process {_sid} {_status} "
         f"(exit code {_exit}{_signal}).\n"
+    )
+    if _attribution:
+        text += f"{_attribution}\n"
+        # A subagent-owned process's full output belongs in the child's
+        # transcript/summary, not as a raw wall in the parent conversation —
+        # trim the tail hard while keeping enough to recognise failures.
+        if isinstance(_out, str) and len(_out) > 600:
+            _out = (
+                "...(output trimmed — subagent-owned process; see the "
+                "delegation's live transcript for full output)\n"
+                + _out[-600:]
+            )
+    text += (
         f"Command: {_cmd}\n"
         f"Output:\n{_out}]"
     )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -2914,7 +3255,7 @@ PROCESS_SCHEMA = {
             },
             "session_id": {
                 "type": "string",
-                "description": "Process session ID (from terminal background output). Required for all actions except 'list'."
+                "description": "Process session ID (from terminal background output). Required for all actions except 'list'. A unique ID prefix works too (e.g. 'proc_4dae' or just '4dae' for proc_4dae56ca81f6)."
             },
             "data": {
                 "type": "string",
